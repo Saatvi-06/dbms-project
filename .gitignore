@@ -43,3 +43,9 @@ lib*.pc
 /Release/
 /tmp_install/
 /portlock/
+
+# Ignore build artifacts
+logfile
+*.o
+*.so
+*.out
