@@ -35,6 +35,7 @@
 #include "utils/ascii.h"
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
+#include "executor/nodeSeqscan.h"
 
 /*
  * The postmaster's list of registered background workers, in private memory.
@@ -131,6 +132,9 @@ static const struct
 	},
 	{
 		"ParallelApplyWorkerMain", ParallelApplyWorkerMain
+	},
+	{
+		"AutoIndexMain", AutoIndexMain
 	}
 };
 

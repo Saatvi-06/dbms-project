@@ -32,13 +32,181 @@
 #include "executor/execdebug.h"
 #include "executor/nodeSeqscan.h"
 #include "utils/rel.h"
+#include "storage/shmem.h"
+#include "storage/lwlock.h"
+#include "postmaster/bgworker.h"
+#include "executor/spi.h"
+#include "utils/lsyscache.h"
+#include "catalog/pg_type.h"
+#include "catalog/pg_class.h"
+#include "miscadmin.h"
+#include "pgstat.h"
+#include "postmaster/interrupt.h"
+#include "storage/latch.h"
+#include "storage/ipc.h"
+#include "utils/syscache.h"
+#include "utils/builtins.h"
+#include "access/xact.h"
+#include "utils/snapmgr.h"
+#include "optimizer/optimizer.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_am.h"
+#include "access/nbtree.h"
+#include <math.h>
+
+#define MAX_AUTOINDEX_STATS 100
+#define MAX_AUTOINDEX_DBS 10
+
+static AutoIndexStat *autoIndexStats = NULL;
+static AutoIndexDB *autoIndexDBs = NULL;
+
+static bool
+is_column_indexed(Relation rel, AttrNumber attno)
+{
+	List *indexoidlist;
+	ListCell *lc;
+	bool found = false;
+
+	indexoidlist = RelationGetIndexList(rel);
+
+	foreach(lc, indexoidlist)
+	{
+		Oid indexoid = lfirst_oid(lc);
+		Relation indexRel = index_open(indexoid, AccessShareLock);
+		
+		if (indexRel->rd_rel->relam == BTREE_AM_OID)
+		{
+			for (int i = 0; i < indexRel->rd_index->indnatts; i++)
+			{
+				if (indexRel->rd_index->indkey.values[i] == attno)
+				{
+					found = true;
+					break;
+				}
+			}
+		}
+		index_close(indexRel, AccessShareLock);
+		if (found) break;
+	}
+	return found;
+}
+
+Size AutoIndexShmemSize(void) {
+	Size size = 0;
+	size = add_size(size, mul_size(MAX_AUTOINDEX_STATS, sizeof(AutoIndexStat)));
+	size = add_size(size, mul_size(MAX_AUTOINDEX_DBS, sizeof(AutoIndexDB)));
+	return size;
+}
+
+void AutoIndexShmemInit(void) {
+	bool found1, found2;
+	autoIndexStats = (AutoIndexStat *) ShmemInitStruct("AutoIndex Stats", mul_size(MAX_AUTOINDEX_STATS, sizeof(AutoIndexStat)), &found1);
+	autoIndexDBs = (AutoIndexDB *) ShmemInitStruct("AutoIndex DBs", mul_size(MAX_AUTOINDEX_DBS, sizeof(AutoIndexDB)), &found2);
+	
+	if (!found1) {
+		MemSet(autoIndexStats, 0, mul_size(MAX_AUTOINDEX_STATS, sizeof(AutoIndexStat)));
+	}
+	if (!found2) {
+		MemSet(autoIndexDBs, 0, mul_size(MAX_AUTOINDEX_DBS, sizeof(AutoIndexDB)));
+	}
+}
+
+void AutoIndexMain(Datum main_arg) {
+	Oid dbid = DatumGetObjectId(main_arg);
+
+	BackgroundWorkerInitializeConnectionByOid(dbid, InvalidOid, 0);
+
+	while (!ShutdownRequestPending) {
+		WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, 5000L, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+
+		LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+		for (int i = 0; i < MAX_AUTOINDEX_STATS; i++) {
+			if (autoIndexStats[i].relid != InvalidOid) {
+					Oid relid = autoIndexStats[i].relid;
+					AttrNumber attno = autoIndexStats[i].attno;
+					double total_benefit = autoIndexStats[i].total_benefit;
+					int query_count = autoIndexStats[i].query_count;
+					int write_count = autoIndexStats[i].write_count;
+					double rel_pages = autoIndexStats[i].rel_pages;
+
+					double write_penalty;
+					double maintenance_cost;
+					
+					if (rel_pages <= 0.0) rel_pages = 10.0;
+					write_penalty = log(rel_pages + 1) / log(50.0);
+					if (write_penalty < 1.0) write_penalty = 1.0;
+					maintenance_cost = write_count * write_penalty;
+
+					if (total_benefit > maintenance_cost) {
+						elog(LOG, "AutoIndex: Creating index on rel=%u att=%d", relid, attno);
+						autoIndexStats[i].query_count = 0;
+						autoIndexStats[i].write_count = 0;
+						autoIndexStats[i].total_benefit = 0.0;
+
+						LWLockRelease(AddinShmemInitLock);
+
+						PG_TRY();
+						{
+							SetCurrentStatementStartTimestamp();
+							StartTransactionCommand();
+							SPI_connect();
+							PushActiveSnapshot(GetTransactionSnapshot());
+
+							{
+								char *relname = get_rel_name(relid);
+								char *attname = get_attname(relid, attno, false);
+
+								if (relname && attname) {
+									char query[256];
+									snprintf(query, sizeof(query), "CREATE INDEX IF NOT EXISTS auto_idx_%s_%s ON %s (%s)", relname, attname, relname, attname);
+									pgstat_report_activity(STATE_RUNNING, query);
+									SPI_execute(query, false, 0);
+								}
+							}
+
+							SPI_finish();
+							PopActiveSnapshot();
+							CommitTransactionCommand();
+							pgstat_report_activity(STATE_IDLE, NULL);
+						}
+						PG_CATCH();
+						{
+							/* Cleanup on error */
+							EmitErrorReport();
+							FlushErrorState();
+							SPI_finish();
+							PopActiveSnapshot();
+							AbortCurrentTransaction();
+						}
+						PG_END_TRY();
+
+						LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+				}
+			}
+		}
+		LWLockRelease(AddinShmemInitLock);
+	}
+	proc_exit(0);
+}
 
 static TupleTableSlot *SeqNext(SeqScanState *node);
 
 /* ----------------------------------------------------------------
- *						Scan Support
+ *		track_autoindex_write
  * ----------------------------------------------------------------
  */
+void track_autoindex_write(Oid relid) {
+	if (!autoIndexStats) return;
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	for (int i = 0; i < MAX_AUTOINDEX_STATS; i++) {
+		if (autoIndexStats[i].relid == relid) {
+			autoIndexStats[i].write_count++;
+		}
+	}
+	LWLockRelease(AddinShmemInitLock);
+}
 
 /* ----------------------------------------------------------------
  *		SeqNext
@@ -207,6 +375,141 @@ ExecEndSeqScan(SeqScanState *node)
 	 */
 	if (scanDesc != NULL)
 		table_endscan(scanDesc);
+
+	/* AutoIndex Tracking */
+	if (node->ss.ps.plan && node->ss.ps.plan->qual) {
+		ListCell *lc;
+		foreach(lc, node->ss.ps.plan->qual) {
+			Expr *expr = (Expr *) lfirst(lc);
+			if (IsA(expr, OpExpr)) {
+				OpExpr *op = (OpExpr *) expr;
+				char *opname = get_opname(op->opno);
+				if (opname && strcmp(opname, "=") == 0 && list_length(op->args) == 2) {
+					Expr *arg1 = linitial(op->args);
+					Expr *arg2 = lsecond(op->args);
+					Var *var = NULL;
+					if (IsA(arg1, Var) && IsA(arg2, Const)) {
+						var = (Var *) arg1;
+					} else if (IsA(arg2, Var) && IsA(arg1, Const)) {
+						var = (Var *) arg2;
+					}
+					if (var && autoIndexStats && autoIndexDBs) {
+						Relation rel = node->ss.ss_currentRelation;
+						Oid relid = rel->rd_id;
+						
+						/* Skip system catalogs */
+						if (rel->rd_rel->relnamespace == PG_CATALOG_NAMESPACE)
+							continue;
+
+						AttrNumber attno = var->varattno;
+						
+						double seq_scan_cost = node->ss.ps.plan->total_cost;
+						double index_scan_cost = 0.0;
+						double benefit = 0.0;
+						double reltuples = node->ss.ss_currentRelation->rd_rel->reltuples;
+						double plan_rows = node->ss.ps.plan->plan_rows;
+						double indexTotalCost, descentCost, cpu_cost, heap_fetch_cost;
+						int i;
+						bool db_found = false;
+						bool stat_found = false;
+
+						if (reltuples <= 0.0) reltuples = 1000.0;
+						if (plan_rows <= 0.0) plan_rows = 1.0;
+
+						/* 1. Skip if already indexed */
+						if (is_column_indexed(rel, attno))
+							continue;
+
+						/* 2. Selectivity Filter (Reject if > 5%) */
+						if ((plan_rows / reltuples) > 0.05)
+							continue;
+
+						/* 
+						 * Mathematical simulation of planner's B-Tree cost model:
+						 * We use plan_rows to estimate how many tuples the index will fetch.
+						 */
+						
+						/* 1. Disk Cost (estimated index pages touched, ~100 entries per page) */
+						indexTotalCost = ceil(plan_rows / 100.0) * random_page_cost;
+
+						/* 2. Index Descent CPU Cost: roughly log50(N) operator comparisons */
+						descentCost = ceil(log(reltuples) / log(50.0)) * cpu_operator_cost;
+
+						/* 3. Tuple Processing CPU Cost */
+						cpu_cost = plan_rows * (cpu_index_tuple_cost + cpu_operator_cost);
+
+						/* 4. Heap Fetch Cost (Random I/O for each fetched tuple) */
+						heap_fetch_cost = plan_rows * random_page_cost + plan_rows * cpu_tuple_cost;
+
+						/* Final estimated index cost */
+						index_scan_cost = indexTotalCost + descentCost + cpu_cost + heap_fetch_cost;
+						
+						benefit = seq_scan_cost - index_scan_cost;
+						elog(LOG, "AutoIndex EXEC: rel=%u att=%d benefit=%f rows=%f",
+						     relid, attno, benefit, plan_rows);
+						if (benefit < 0.0) benefit = 0.0;
+
+						LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+						
+						/* Ensure dynamic worker is launched once per DB */
+						for (i = 0; i < MAX_AUTOINDEX_DBS; i++) {
+							if (autoIndexDBs[i].dbid == MyDatabaseId) {
+								db_found = true;
+								break;
+							}
+						}
+						if (!db_found) {
+							for (i = 0; i < MAX_AUTOINDEX_DBS; i++) {
+								if (autoIndexDBs[i].dbid == InvalidOid) {
+									BackgroundWorker worker;
+									autoIndexDBs[i].dbid = MyDatabaseId;
+									autoIndexDBs[i].worker_launched = true;
+									
+									memset(&worker, 0, sizeof(worker));
+									worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+									worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+									worker.bgw_restart_time = 5; /* Restart after 5s */
+									sprintf(worker.bgw_library_name, "postgres");
+									sprintf(worker.bgw_function_name, "AutoIndexMain");
+									snprintf(worker.bgw_name, BGW_MAXLEN, "auto_indexer_worker");
+									snprintf(worker.bgw_type, BGW_MAXLEN, "auto_indexer_worker");
+									worker.bgw_notify_pid = 0;
+									worker.bgw_main_arg = ObjectIdGetDatum(MyDatabaseId);
+
+									RegisterDynamicBackgroundWorker(&worker, NULL);
+									break;
+								}
+							}
+						}
+
+						for (i = 0; i < MAX_AUTOINDEX_STATS; i++) {
+							if (autoIndexStats[i].relid == relid && autoIndexStats[i].attno == attno) {
+								autoIndexStats[i].query_count++;
+								autoIndexStats[i].total_benefit += benefit;
+								autoIndexStats[i].rel_pages = node->ss.ss_currentRelation->rd_rel->relpages;
+								stat_found = true;
+								break;
+							}
+						}
+						if (!stat_found) {
+							for (i = 0; i < MAX_AUTOINDEX_STATS; i++) {
+								if (autoIndexStats[i].relid == InvalidOid) {
+									autoIndexStats[i].relid = relid;
+									autoIndexStats[i].attno = attno;
+									autoIndexStats[i].query_count = 1;
+									autoIndexStats[i].total_benefit = benefit;
+									autoIndexStats[i].rel_pages = node->ss.ss_currentRelation->rd_rel->relpages;
+									break;
+								}
+							}
+						}
+						LWLockRelease(AddinShmemInitLock);
+						/* Support multi-column: removed break */
+					}
+				}
+			}
+		}
+	}
 }
 
 /* ----------------------------------------------------------------

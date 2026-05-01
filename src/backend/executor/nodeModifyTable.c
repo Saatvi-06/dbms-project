@@ -59,6 +59,7 @@
 #include "executor/execPartition.h"
 #include "executor/executor.h"
 #include "executor/nodeModifyTable.h"
+#include "executor/nodeSeqscan.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
@@ -815,6 +816,8 @@ ExecInsert(ModifyTableContext *context,
 
 	resultRelationDesc = resultRelInfo->ri_RelationDesc;
 
+	track_autoindex_write(resultRelationDesc->rd_id);
+
 	/*
 	 * Open the table's indexes, if we have not done so already, so that we
 	 * can add new index entries for the inserted tuple.
@@ -1465,6 +1468,8 @@ ExecDelete(ModifyTableContext *context,
 
 	if (tupleDeleted)
 		*tupleDeleted = false;
+
+	track_autoindex_write(resultRelationDesc->rd_id);
 
 	/*
 	 * Prepare for the delete.  This includes BEFORE ROW triggers, so we're
@@ -2300,6 +2305,8 @@ ExecUpdate(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	Relation	resultRelationDesc = resultRelInfo->ri_RelationDesc;
 	UpdateContext updateCxt = {0};
 	TM_Result	result;
+
+	track_autoindex_write(resultRelationDesc->rd_id);
 
 	/*
 	 * abort the operation if not running transactions

@@ -28,4 +28,26 @@ extern void ExecSeqScanReInitializeDSM(SeqScanState *node, ParallelContext *pcxt
 extern void ExecSeqScanInitializeWorker(SeqScanState *node,
 										ParallelWorkerContext *pwcxt);
 
+/* Automatic index creation tracker */
+typedef struct {
+	Oid relid;
+	AttrNumber attno;
+	double total_benefit;
+	int query_count;
+	int write_count;
+	double rel_pages;
+} AutoIndexStat;
+
+typedef struct {
+	Oid dbid;
+	bool worker_launched;
+} AutoIndexDB;
+
+extern void AutoIndexShmemInit(void);
+extern Size AutoIndexShmemSize(void);
+
+extern void track_autoindex_write(Oid relid);
+
+extern void AutoIndexMain(Datum main_arg) pg_attribute_noreturn();
+
 #endif							/* NODESEQSCAN_H */

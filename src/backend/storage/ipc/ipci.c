@@ -49,6 +49,9 @@
 #include "storage/spin.h"
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
+#include "executor/nodeSeqscan.h"
+
+
 
 /* GUCs */
 int			shared_memory_type = DEFAULT_SHARED_MEMORY_TYPE;
@@ -142,6 +145,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, SyncScanShmemSize());
 	size = add_size(size, AsyncShmemSize());
 	size = add_size(size, StatsShmemSize());
+	size = add_size(size, AutoIndexShmemSize());
 #ifdef EXEC_BACKEND
 	size = add_size(size, ShmemBackendArraySize());
 #endif
@@ -294,6 +298,7 @@ CreateSharedMemoryAndSemaphores(void)
 	SyncScanShmemInit();
 	AsyncShmemInit();
 	StatsShmemInit();
+	AutoIndexShmemInit();
 
 #ifdef EXEC_BACKEND
 
