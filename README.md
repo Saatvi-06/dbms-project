@@ -38,5 +38,20 @@ Index creation is an expensive operation that requires taking locks and performi
   ```
 - If the threshold is satisfied, the worker connects to the database via SPI (Server Programming Interface) and asynchronously executes a `CREATE INDEX` command on the identified column.
 
+## 🚀 How to Run
+
+```bash
+export PATH=/home/saatvika/pg_install/bin:$PATH
+export PGDATA=/home/saatvika/pgdata
+export PGPORT=5435
+
+make -j$(nproc)
+make install
+
+pg_ctl -D /home/saatvika/pgdata stop -m immediate
+pg_ctl -l logfile start
+
+psql postgres
+
 ## Summary
 By combining query execution instrumentation, shared memory statistics, cost-based planner simulation, and asynchronous background workers, this project transforms PostgreSQL into an intelligent, self-tuning database system capable of automatically mitigating missing-index performance bottlenecks.
